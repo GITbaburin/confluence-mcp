@@ -1,10 +1,6 @@
-printf '%s\n' '{
-  "$schema": "https://openapi.vercel.sh/vercel.json",
-  "rewrites": [
-    { "source": "/health", "destination": "/api/sse.ts" }
-  ]
-}' > vercel.json
-
-git add vercel.json
-git commit -m "Vercel: remove legacy runtime; add /health rewrite"
-git push origin main
+{
+    "$schema": "https://openapi.vercel.sh/vercel.json",
+    "rewrites": [
+      { "source": "/health", "destination": "/api/sse" }
+    ]
+  }
