@@ -1,7 +1,5 @@
-printf "%s\n" \
-"node_modules/" \
-"dist/" \
-".env" \
-".vercel/" \
-".DS_Store" \
-> .gitignore
+node_modules/
+dist/
+.env
+.vercel/
+.DS_Store
