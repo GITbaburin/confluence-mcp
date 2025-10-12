@@ -1,8 +1,8 @@
 // api/sse.ts
 import express from "express";
-import { randomUUID } from "node:crypto";
 import serverless from "serverless-http";
 import { z } from "zod";
+import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
@@ -10,111 +10,113 @@ const {
   ATLASSIAN_SITE,
   ATLASSIAN_EMAIL,
   ATLASSIAN_API_TOKEN,
-  MCP_BEARER
+  MCP_BEARER,
 } = process.env as Record<string, string>;
 
 if (!ATLASSIAN_SITE || !ATLASSIAN_EMAIL || !ATLASSIAN_API_TOKEN || !MCP_BEARER) {
   throw new Error("Missing required envs: ATLASSIAN_* and MCP_BEARER");
 }
 
+// basic auth for Atlassian REST
 const basic = "Basic " + Buffer.from(`${ATLASSIAN_EMAIL}:${ATLASSIAN_API_TOKEN}`).toString("base64");
 
 const app = express();
-app.use(express.json());
 
-// Tiny auth – require Authorization: Bearer <MCP_BEARER>
+// IMPORTANT: parse JSON so the transport receives req.body
+app.use(express.json({ limit: "5mb" }));
+
+// public health
+app.get("/health", (_req, res) => res.status(200).send("ok"));
+
+// auth for everything else
 app.use((req, res, next) => {
+  if (req.path === "/health") return next();
   const auth = req.headers.authorization || "";
   if (auth !== `Bearer ${MCP_BEARER}`) return res.status(401).send("unauthorized");
   next();
 });
 
-// Health (not protected so Vercel checks work)
-app.get("/health", (_req, res) => res.status(200).send("ok"));
+// --- MCP server & tools ---
+const server = new McpServer({ name: "confluence-mcp", version: "1.0.0" });
 
-// ---------------- MCP server ----------------
-const server = new McpServer({ name: "confluence-mcp", version: "0.1.0" });
-
-// Register tools (newer SDK uses registerTool with schemas)
-server.registerTool(
+// 1) search
+server.tool(
   "confluence.search",
   {
-    title: "Search Confluence with CQL",
-    description: "Return pages that match a CQL query",
-    inputSchema: { cql: z.string(), limit: z.number().default(5) }
+    description: "Search Confluence with CQL",
+    inputSchema: z.object({
+      cql: z.string(),
+      limit: z.number().int().positive().max(50).default(10),
+    }),
   },
   async ({ cql, limit }) => {
     const url = new URL(`${ATLASSIAN_SITE}/wiki/rest/api/search`);
     url.searchParams.set("cql", cql);
     url.searchParams.set("limit", String(limit));
     const r = await fetch(url.toString(), { headers: { Authorization: basic } });
-    if (!r.ok) throw new Error(`search failed: ${r.status} ${await r.text()}`);
-    const data: any = await r.json();
-    const out = (data.results || [])
-      .filter((h: any) => h.content?.type === "page")
-      .map((h: any) => ({
-        id: h.content.id,
-        title: h.content.title,
-        url: `${ATLASSIAN_SITE}/wiki${h.content._links.webui}`
-      }));
-    // Return TEXT (stringified JSON) to satisfy content types
-    return { content: [{ type: "text", text: JSON.stringify(out) }] };
+    const json = await r.json();
+    const results = (json?.results || []).map((it: any) => ({
+      id: it.content?.id,
+      title: it.title,
+      url: `${ATLASSIAN_SITE}/wiki${it.url}`,
+    }));
+    return { content: [{ type: "json", json: results }] };
   }
 );
 
-server.registerTool(
+// 2) page
+server.tool(
   "confluence.page",
   {
-    title: "Get Confluence page (storage HTML)",
-    description: "Fetch a page by ID with storage HTML body",
-    inputSchema: { id: z.string() }
+    description: "Get a page storage HTML by id",
+    inputSchema: z.object({ id: z.string() }),
   },
   async ({ id }) => {
-    const url = new URL(`${ATLASSIAN_SITE}/wiki/api/v2/pages/${id}`);
-    url.searchParams.set("body-format", "storage");
-    const r = await fetch(url.toString(), { headers: { Authorization: basic } });
-    if (!r.ok) throw new Error(`page fetch failed: ${r.status} ${await r.text()}`);
-    const data: any = await r.json();
-    const html = data?.body?.storage?.value || "";
+    const r = await fetch(
+      `${ATLASSIAN_SITE}/wiki/api/v2/pages/${id}?body-format=storage`,
+      { headers: { Authorization: basic } }
+    );
+    const json = await r.json();
+    const html = json?.body?.storage?.value ?? "";
     return { content: [{ type: "text", text: html }] };
   }
 );
 
-server.registerTool(
+// 3) attachments
+server.tool(
   "confluence.attachments",
   {
-    title: "List page attachments",
-    description: "List attachments and download paths for a page",
-    inputSchema: { id: z.string(), limit: z.number().default(20) }
+    description: "List attachments for a page id",
+    inputSchema: z.object({
+      id: z.string(),
+      limit: z.number().int().positive().max(50).default(10),
+    }),
   },
   async ({ id, limit }) => {
-    const url = new URL(`${ATLASSIAN_SITE}/wiki/rest/api/content/${id}/child/attachment`);
-    url.searchParams.set("limit", String(limit));
-    const r = await fetch(url.toString(), { headers: { Authorization: basic } });
-    if (!r.ok) throw new Error(`attachments failed: ${r.status} ${await r.text()}`);
-    const data: any = await r.json();
-    const out = (data.results || []).map((a: any) => ({
+    const r = await fetch(
+      `${ATLASSIAN_SITE}/wiki/api/v2/pages/${id}/attachments?limit=${limit}`,
+      { headers: { Authorization: basic } }
+    );
+    const json = await r.json();
+    const items = (json?.results || []).map((a: any) => ({
       title: a.title,
-      download_url: `/wiki${a._links.download}`
+      download_url: a._links?.download ? `${ATLASSIAN_SITE}${a._links.download}` : null,
     }));
-    return { content: [{ type: "text", text: JSON.stringify(out) }] };
+    return { content: [{ type: "json", json: items }] };
   }
 );
 
-// Streamable HTTP endpoint (per SDK docs):
-// Create a transport per request and hand it the Express req/res.
+// MCP over HTTP (JSON response — no long SSE needed)
 app.post("/api/sse", async (req, res) => {
-    const transport = new StreamableHTTPServerTransport({
-      // required in current SDK:
-      sessionIdGenerator: () => randomUUID(),
-      // optional but handy for serverless:
-      enableJsonResponse: true
-    });
-  
-    res.on("close", () => transport.close());
-    await server.connect(transport);
-    await transport.handleRequest(req as any, res as any, req.body);
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
+    enableJsonResponse: true,
   });
+  await server.connect(transport);
+  await transport.handleRequest(req as any, res as any, req.body);
+});
 
-// Export for Vercel
+// (Optional) quick GET to verify auth header manually
+app.get("/api/sse", (_req, res) => res.status(200).send("mcp-ok"));
+
 export default serverless(app);
