@@ -1,0 +1,7 @@
+{
+    "functions": { "api/sse.ts": { "runtime": "nodejs18.x" } },
+    "routes": [
+      { "src": "/api/sse", "dest": "api/sse.ts" },
+      { "src": "/health", "dest": "api/sse.ts" }
+    ]
+  }
