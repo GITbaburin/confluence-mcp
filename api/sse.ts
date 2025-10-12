@@ -1,9 +1,8 @@
 // api/sse.ts
-import { Server as MCPServer } from "@modelcontextprotocol/sdk/server/index.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 
-// ---- envs ----
 const {
   ATLASSIAN_SITE,
   ATLASSIAN_EMAIL,
@@ -18,8 +17,8 @@ if (!ATLASSIAN_SITE || !ATLASSIAN_EMAIL || !ATLASSIAN_API_TOKEN || !MCP_BEARER) 
 // Basic auth for Confluence REST
 const basic = "Basic " + Buffer.from(`${ATLASSIAN_EMAIL}:${ATLASSIAN_API_TOKEN}`).toString("base64");
 
-// ---- Create a single MCP server instance with your tools ----
-const server = new MCPServer(
+// ---- one MCP server instance with your tools ----
+const server = new McpServer(
   { name: "confluence-mcp", version: "1.0.0" },
   { capabilities: { tools: {} } }
 );
@@ -36,37 +35,26 @@ server.tool(
   },
   async ({ cql, limit }) => {
     const url = `${ATLASSIAN_SITE}/wiki/rest/api/search?cql=${encodeURIComponent(cql)}&limit=${limit}`;
-    const r = await fetch(url, {
-      headers: { Authorization: basic, Accept: "application/json" },
-    });
+    const r = await fetch(url, { headers: { Authorization: basic, Accept: "application/json" } });
     const data = await r.json();
-    return {
-      content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-    };
+    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
   }
 );
 
-// Page HTML by id
+// Page HTML
 server.tool(
   "confluence.pageHtml",
-  {
-    title: "Get Confluence Page (storage format HTML)",
-    inputSchema: z.object({ id: z.string() }),
-  },
+  { title: "Get Confluence Page (storage HTML)", inputSchema: z.object({ id: z.string() }) },
   async ({ id }) => {
-    const url = `${ATLASSIAN_SITE}/wiki/rest/api/content/${encodeURIComponent(
-      id
-    )}?expand=body.storage`;
-    const r = await fetch(url, {
-      headers: { Authorization: basic, Accept: "application/json" },
-    });
+    const url = `${ATLASSIAN_SITE}/wiki/rest/api/content/${encodeURIComponent(id)}?expand=body.storage`;
+    const r = await fetch(url, { headers: { Authorization: basic, Accept: "application/json" } });
     const data = await r.json();
     const html = data?.body?.storage?.value ?? "";
     return { content: [{ type: "text", text: html }] };
   }
 );
 
-// Attachments list by page id
+// Attachments list
 server.tool(
   "confluence.attachments",
   {
@@ -74,43 +62,28 @@ server.tool(
     inputSchema: z.object({ id: z.string(), limit: z.number().int().min(1).max(50).default(20) }),
   },
   async ({ id, limit }) => {
-    const url = `${ATLASSIAN_SITE}/wiki/rest/api/content/${encodeURIComponent(
-      id
-    )}/child/attachment?limit=${limit}`;
-    const r = await fetch(url, {
-      headers: { Authorization: basic, Accept: "application/json" },
-    });
+    const url = `${ATLASSIAN_SITE}/wiki/rest/api/content/${encodeURIComponent(id)}/child/attachment?limit=${limit}`;
+    const r = await fetch(url, { headers: { Authorization: basic, Accept: "application/json" } });
     const data = await r.json();
     return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
   }
 );
 
-// Simple health
+// Health is via /api/health (keep your current file). This handler is ONLY for SSE.
 export default async function handler(req: any, res: any) {
-  // tiny auth for all requests
   const auth = req.headers.authorization || "";
   if (auth !== `Bearer ${MCP_BEARER}`) {
     res.status(401).send("unauthorized");
     return;
   }
 
-  // If the client isn’t asking for SSE, reply quick (useful for curl sanity checks)
-  const wantsSSE = String(req.headers.accept || "").includes("text/event-stream");
-  if (!wantsSSE) {
+  // Simple probe for non-SSE requests (curl sanity, Vercel checks, etc.)
+  if (!String(req.headers.accept || "").includes("text/event-stream")) {
     res.status(200).send("mcp-ok");
     return;
   }
 
-  // Per-request transport (this is the important bit for Agent Builder)
-  const transport = new StreamableHTTPServerTransport({
-    request: req,
-    response: res,
-    // unique id per connection; avoids optional typing complaints
-    sessionIdGenerator: () =>
-      // Node 18+/22 have crypto.randomUUID
-      (globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)),
-  });
-
-  // Hand the connection to the MCP server (this immediately sends the SSE handshake)
+  // Minimal per-request transport — no generators or extras
+  const transport = new StreamableHTTPServerTransport({ request: req, response: res });
   await server.connect(transport);
 }
